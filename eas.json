@@ -1,0 +1,22 @@
+{
+  "build": {
+    "production": {
+      "ios": {
+        "autoIncrement": true
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "6762575572",
+        "ascApiKeyPath": "K:/Apps/mag-7/keys/AuthKey_H45TQ59WYZ.p8",
+        "ascApiKeyIssuerId": "33a0eb3e-cc2f-4696-a35c-7e38d2c7231e",
+        "ascApiKeyId": "H45TQ59WYZ"
+      }
+    }
+  },
+  "cli": {
+    "appVersionSource": "remote"
+  }
+}
