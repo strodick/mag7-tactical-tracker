@@ -1,13 +1,8 @@
-import { sampleMag7Data } from "../data/sampleMag7Data";
 import { getCoreSignal } from "./coreSignalEngine";
 import { CoreSignal, PositionState, StockIndicatorState } from "../types/trading";
+import { MarketDataSet, MarketPricePoint, MarketTicker } from "../services/marketDataService";
 
-type PricePoint = {
-  date: string;
-  close: number;
-};
-
-type Ticker = "AAPL" | "MSFT" | "GOOGL" | "AMZN" | "NVDA" | "META" | "TSLA";
+type Ticker = Exclude<MarketTicker, "SPY">;
 
 export type DashboardSignal = {
   ticker: Ticker;
@@ -43,60 +38,48 @@ const companyNames: Record<Ticker, string> = {
 
 const tickers: Ticker[] = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"];
 
-function movingAverage(series: PricePoint[], days: number, endIndex = series.length): number {
+function movingAverage(series: MarketPricePoint[], days: number, endIndex = series.length): number {
   const slice = series.slice(Math.max(0, endIndex - days), endIndex);
   if (slice.length === 0) return 0;
   return slice.reduce((sum, point) => sum + point.close, 0) / slice.length;
 }
 
-function calculateReturn(series: PricePoint[], lookbackDays: number): number {
+function averageVolume(series: MarketPricePoint[], days: number): number {
+  const slice = series.slice(Math.max(0, series.length - days));
+  if (slice.length === 0) return 0;
+  return slice.reduce((sum, point) => sum + point.volume, 0) / slice.length;
+}
+
+function calculateReturn(series: MarketPricePoint[], lookbackDays: number): number {
+  if (!series || series.length < 2) return 0;
   const latest = series[series.length - 1]?.close ?? 0;
   const prior = series[Math.max(0, series.length - lookbackDays)]?.close ?? latest;
-  if (prior === 0) return 0;
+  if (!prior) return 0;
   return (latest - prior) / prior;
 }
 
-function calculateSlowStochasticK(series: PricePoint[], endIndex: number): number {
+function calculateSlowStochasticK(series: MarketPricePoint[], endIndex: number): number {
   const kPeriod = 5;
   const smoothing = 3;
-  const rawValues: number[] = [];
+  const values: number[] = [];
+
+  if (!series || series.length < kPeriod + smoothing) return 50;
 
   for (let offset = smoothing - 1; offset >= 0; offset--) {
     const currentEnd = endIndex - offset;
     const window = series.slice(Math.max(0, currentEnd - kPeriod), currentEnd);
     const close = series[currentEnd - 1]?.close ?? 0;
-    const low = Math.min(...window.map((point) => point.close));
-    const high = Math.max(...window.map((point) => point.close));
+    const high = Math.max(...window.map((point) => point.high));
+    const low = Math.min(...window.map((point) => point.low));
 
-    if (high === low) {
-      rawValues.push(50);
+    if (!Number.isFinite(high) || !Number.isFinite(low) || high === low) {
+      values.push(50);
     } else {
-      rawValues.push(((close - low) / (high - low)) * 100);
+      values.push(((close - low) / (high - low)) * 100);
     }
   }
 
-  return rawValues.reduce((sum, value) => sum + value, 0) / rawValues.length;
-}
-
-function estimateVolume(ticker: Ticker, latestIndex: number, isLeader: boolean): { volume: number; averageVolume50Day: number } {
-  const baseByTicker: Record<Ticker, number> = {
-    AAPL: 58_000_000,
-    MSFT: 24_000_000,
-    GOOGL: 32_000_000,
-    AMZN: 42_000_000,
-    NVDA: 310_000_000,
-    META: 15_000_000,
-    TSLA: 95_000_000,
-  };
-
-  const averageVolume50Day = baseByTicker[ticker];
-  const cycleBoost = latestIndex % 3 === 0 ? 1.08 : 0.96;
-  const leadershipBoost = isLeader ? 1.05 : 0.97;
-
-  return {
-    volume: Math.round(averageVolume50Day * cycleBoost * leadershipBoost),
-    averageVolume50Day,
-  };
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 function getExtensionLabel(extensionFrom200Day: number): "Healthy" | "Caution" | "Extended" {
@@ -113,11 +96,16 @@ function explain(signal: CoreSignal, stock: StockIndicatorState): string {
   return "No new action until the full setup appears.";
 }
 
-export function buildDashboardSignals(positionByTicker: Partial<Record<Ticker, PositionState>> = {}): DashboardSignal[] {
+export function buildDashboardSignals(
+  marketData: MarketDataSet,
+  positionByTicker: Partial<Record<Ticker, PositionState>> = {}
+): DashboardSignal[] {
+  if (!marketData) return [];
+
   const momentumRanks = tickers
     .map((ticker) => ({
       ticker,
-      sixMonthReturn: calculateReturn(sampleMag7Data[ticker], 126),
+      sixMonthReturn: calculateReturn(marketData[ticker] ?? [], 126),
     }))
     .sort((a, b) => b.sixMonthReturn - a.sixMonthReturn)
     .reduce<Record<Ticker, number>>((rankMap, item, index) => {
@@ -126,19 +114,44 @@ export function buildDashboardSignals(positionByTicker: Partial<Record<Ticker, P
     }, {} as Record<Ticker, number>);
 
   return tickers.map((ticker) => {
-    const series = sampleMag7Data[ticker];
+    const series = marketData[ticker] ?? [];
     const latestIndex = series.length;
     const latest = series[latestIndex - 1];
-    const previousStochasticK = calculateSlowStochasticK(series, latestIndex - 1);
-    const stochasticK = calculateSlowStochasticK(series, latestIndex);
+
+    if (!latest) {
+      return {
+        ticker,
+        company: companyNames[ticker],
+        signal: "NONE",
+        price: 0,
+        trendUp: false,
+        leader: false,
+        momentumRank: momentumRanks[ticker] ?? 7,
+        sixMonthReturn: 0,
+        stochasticK: 50,
+        previousStochasticK: 50,
+        stochasticCrossedAbove20: false,
+        stochasticAbove80: false,
+        volume: 0,
+        averageVolume50Day: 0,
+        volumeConfirmed: false,
+        movingAverage200Day: 0,
+        extensionFrom200Day: 0,
+        extensionLabel: "Healthy",
+        explanation: "No market data available for this ticker.",
+      };
+    }
+
+    const price = latest.close;
     const movingAverage200Day = movingAverage(series, 200);
     const previousMovingAverage200Day = movingAverage(series, 200, latestIndex - 30);
-    const price = latest.close;
+    const stochasticK = calculateSlowStochasticK(series, latestIndex);
+    const previousStochasticK = calculateSlowStochasticK(series, latestIndex - 1);
+    const averageVolume50Day = averageVolume(series, 50);
     const trendUp = price > movingAverage200Day && movingAverage200Day > previousMovingAverage200Day;
-    const momentumRank = momentumRanks[ticker];
+    const momentumRank = momentumRanks[ticker] ?? 7;
     const leader = momentumRank <= 3;
-    const { volume, averageVolume50Day } = estimateVolume(ticker, latestIndex, leader);
-    const extensionFrom200Day = (price - movingAverage200Day) / movingAverage200Day;
+    const extensionFrom200Day = movingAverage200Day > 0 ? (price - movingAverage200Day) / movingAverage200Day : 0;
 
     const stock: StockIndicatorState = {
       ticker,
@@ -149,7 +162,7 @@ export function buildDashboardSignals(positionByTicker: Partial<Record<Ticker, P
       momentumRank,
       stochasticK,
       previousStochasticK,
-      volume,
+      volume: latest.volume,
       averageVolume50Day,
       price,
       movingAverage200Day,
@@ -171,9 +184,9 @@ export function buildDashboardSignals(positionByTicker: Partial<Record<Ticker, P
       previousStochasticK,
       stochasticCrossedAbove20: previousStochasticK < 20 && stochasticK >= 20,
       stochasticAbove80: stochasticK >= 80,
-      volume,
+      volume: latest.volume,
       averageVolume50Day,
-      volumeConfirmed: volume >= averageVolume50Day,
+      volumeConfirmed: averageVolume50Day > 0 && latest.volume >= averageVolume50Day,
       movingAverage200Day,
       extensionFrom200Day,
       extensionLabel: getExtensionLabel(extensionFrom200Day),
