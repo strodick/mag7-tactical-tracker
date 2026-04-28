@@ -1,4 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import Constants from "expo-constants";
 import { sampleMag7Data } from "../data/sampleMag7Data";
 
 export type MarketTicker = "AAPL" | "MSFT" | "GOOGL" | "AMZN" | "NVDA" | "META" | "TSLA" | "SPY";
@@ -57,17 +58,26 @@ function normalizeSampleData(): MarketDataSet {
   return result;
 }
 
-async function fetchTicker(ticker: MarketTicker): Promise<MarketPricePoint[]> {
-  const apiKey = process.env.EXPO_PUBLIC_TWELVE_DATA_API_KEY;
+function getApiKey(): string {
+  const envKey = process.env.EXPO_PUBLIC_TWELVE_DATA_API_KEY;
+  const expoKey = Constants.expoConfig?.extra?.EXPO_PUBLIC_TWELVE_DATA_API_KEY;
 
-  if (!apiKey) {
+  const key = envKey || expoKey;
+
+  if (!key) {
     throw new Error("Missing Twelve Data API key");
   }
+
+  return key;
+}
+
+async function fetchTicker(ticker: MarketTicker): Promise<MarketPricePoint[]> {
+  const apiKey = getApiKey();
 
   const params = new URLSearchParams({
     symbol: ticker,
     interval: "1day",
-    outputsize: "260",
+    outputsize: "1000",
     order: "ASC",
     format: "JSON",
     apikey: apiKey,
@@ -93,7 +103,6 @@ async function fetchTicker(ticker: MarketTicker): Promise<MarketPricePoint[]> {
 async function fetchLiveMarketData(): Promise<MarketDataSet> {
   const result = {} as MarketDataSet;
 
-  // Sequential requests reduce the chance of hitting free-plan burst limits.
   for (const ticker of TICKERS) {
     result[ticker] = await fetchTicker(ticker);
   }
