@@ -3,11 +3,14 @@ import { CoreSignal, PositionState, StockIndicatorState } from "../types/trading
 import { MarketDataSet, MarketPricePoint, MarketTicker } from "../services/marketDataService";
 
 type Ticker = Exclude<MarketTicker, "SPY">;
+export type LeverageSignal = "BUY 2X" | "HOLD 2X" | "EXIT 2X" | "NO 2X";
 
 export type DashboardSignal = {
   ticker: Ticker;
   company: string;
   signal: CoreSignal;
+  leverageSignal: LeverageSignal;
+  confidenceScore: number;
   price: number;
   trendUp: boolean;
   leader: boolean;
@@ -83,17 +86,91 @@ function calculateSlowStochasticK(series: MarketPricePoint[], endIndex: number):
 }
 
 function getExtensionLabel(extensionFrom200Day: number): "Healthy" | "Caution" | "Extended" {
-  if (extensionFrom200Day > 0.25) return "Extended";
-  if (extensionFrom200Day > 0.15) return "Caution";
+  if (extensionFrom200Day > 0.2) return "Extended";
+  if (extensionFrom200Day > 0.12) return "Caution";
   return "Healthy";
 }
 
-function explain(signal: CoreSignal, stock: StockIndicatorState): string {
+function calculateConfidenceScore(params: {
+  trendUp: boolean;
+  leader: boolean;
+  momentumRank: number;
+  stochasticK: number;
+  previousStochasticK: number;
+  volumeConfirmed: boolean;
+  extensionFrom200Day: number;
+}) {
+  let score = 0;
+
+  if (params.trendUp) score += 25;
+  if (params.leader) score += 20;
+  if (params.momentumRank === 1) score += 10;
+  else if (params.momentumRank === 2) score += 8;
+  else if (params.momentumRank === 3) score += 6;
+
+  const crossedAbove20 = params.previousStochasticK < 20 && params.stochasticK >= 20;
+  const stochasticRising = params.stochasticK > params.previousStochasticK;
+  const stochasticBuyZone = params.stochasticK >= 20 && params.stochasticK <= 55;
+
+  if (crossedAbove20) score += 20;
+  else if (stochasticRising && stochasticBuyZone) score += 12;
+  else if (params.stochasticK >= 80) score -= 10;
+
+  if (params.volumeConfirmed) score += 15;
+
+  if (params.extensionFrom200Day <= 0.12) score += 10;
+  else if (params.extensionFrom200Day <= 0.15) score += 5;
+  else if (params.extensionFrom200Day > 0.2) score -= 15;
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function getLeverageSignal(params: {
+  coreSignal: CoreSignal;
+  confidenceScore: number;
+  trendUp: boolean;
+  leader: boolean;
+  stochasticK: number;
+  previousStochasticK: number;
+  volumeConfirmed: boolean;
+  extensionFrom200Day: number;
+  hasLeveragedPosition?: boolean;
+}): LeverageSignal {
+  if (params.hasLeveragedPosition && (!params.trendUp || params.stochasticK >= 80 || params.extensionFrom200Day > 0.2)) {
+    return "EXIT 2X";
+  }
+
+  if (params.hasLeveragedPosition) {
+    return "HOLD 2X";
+  }
+
+  const crossedAbove20 = params.previousStochasticK < 20 && params.stochasticK >= 20;
+  const inBuyZone = params.stochasticK >= 20 && params.stochasticK <= 55;
+
+  if (
+    params.coreSignal === "BUY" &&
+    params.confidenceScore >= 80 &&
+    params.trendUp &&
+    params.leader &&
+    crossedAbove20 &&
+    inBuyZone &&
+    params.volumeConfirmed &&
+    params.extensionFrom200Day <= 0.12
+  ) {
+    return "BUY 2X";
+  }
+
+  return "NO 2X";
+}
+
+function explain(signal: CoreSignal, leverageSignal: LeverageSignal, confidenceScore: number, stock: StockIndicatorState): string {
+  if (leverageSignal === "BUY 2X") return `High-confidence setup (${confidenceScore}%). Core buy and 2X trigger are both aligned.`;
+  if (leverageSignal === "EXIT 2X") return "Exit 2X exposure because trend, overbought, or extension risk is elevated.";
   if (!stock.trendUp) return "Trend filter failed. Avoid new buys until price is above a rising 200-day average.";
-  if (signal === "BUY") return "Trend, leadership, stochastic recovery, volume, and extension filters are aligned.";
+  if (signal === "BUY") return `Core buy setup confirmed with ${confidenceScore}% confidence.`;
   if (signal === "REDUCE") return "Take profits or reduce risk because the stock is overbought, too extended, or losing leadership.";
-  if (signal === "HOLD") return "Trend is intact, but this is not a fresh 2x entry setup.";
-  return "No new action until the full setup appears.";
+  if (signal === "HOLD") return "Trend is intact, but this is not a fresh 2X entry setup.";
+  return "Watch this stock. Conditions are not yet aligned for entry.";
 }
 
 export function buildDashboardSignals(
@@ -123,6 +200,8 @@ export function buildDashboardSignals(
         ticker,
         company: companyNames[ticker],
         signal: "NONE",
+        leverageSignal: "NO 2X",
+        confidenceScore: 0,
         price: 0,
         trendUp: false,
         leader: false,
@@ -152,6 +231,7 @@ export function buildDashboardSignals(
     const momentumRank = momentumRanks[ticker] ?? 7;
     const leader = momentumRank <= 3;
     const extensionFrom200Day = movingAverage200Day > 0 ? (price - movingAverage200Day) / movingAverage200Day : 0;
+    const volumeConfirmed = averageVolume50Day > 0 && latest.volume >= averageVolume50Day * 1.05;
 
     const stock: StockIndicatorState = {
       ticker,
@@ -170,11 +250,33 @@ export function buildDashboardSignals(
 
     const position = positionByTicker[ticker] ?? { hasCorePosition: false };
     const signal = getCoreSignal(stock, position);
+    const confidenceScore = calculateConfidenceScore({
+      trendUp,
+      leader,
+      momentumRank,
+      stochasticK,
+      previousStochasticK,
+      volumeConfirmed,
+      extensionFrom200Day,
+    });
+    const leverageSignal = getLeverageSignal({
+      coreSignal: signal,
+      confidenceScore,
+      trendUp,
+      leader,
+      stochasticK,
+      previousStochasticK,
+      volumeConfirmed,
+      extensionFrom200Day,
+      hasLeveragedPosition: position.hasLeveragedPosition,
+    });
 
     return {
       ticker,
       company: companyNames[ticker],
       signal,
+      leverageSignal,
+      confidenceScore,
       price,
       trendUp,
       leader,
@@ -186,11 +288,11 @@ export function buildDashboardSignals(
       stochasticAbove80: stochasticK >= 80,
       volume: latest.volume,
       averageVolume50Day,
-      volumeConfirmed: averageVolume50Day > 0 && latest.volume >= averageVolume50Day,
+      volumeConfirmed,
       movingAverage200Day,
       extensionFrom200Day,
       extensionLabel: getExtensionLabel(extensionFrom200Day),
-      explanation: explain(signal, stock),
+      explanation: explain(signal, leverageSignal, confidenceScore, stock),
     };
   });
 }
