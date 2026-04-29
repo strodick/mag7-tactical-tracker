@@ -4,6 +4,7 @@ import { MarketDataSet, MarketPricePoint, MarketTicker } from "../services/marke
 
 type Ticker = Exclude<MarketTicker, "SPY">;
 export type LeverageSignal = "BUY 2X" | "HOLD 2X" | "EXIT 2X" | "NO 2X";
+export type TrendStage = "STRONG UPTREND" | "UPTREND" | "NEUTRAL" | "DOWNTREND";
 
 export type DashboardSignal = {
   ticker: Ticker;
@@ -11,6 +12,8 @@ export type DashboardSignal = {
   signal: CoreSignal;
   leverageSignal: LeverageSignal;
   confidenceScore: number;
+  trendScore: number;
+  trendStage: TrendStage;
   price: number;
   trendUp: boolean;
   leader: boolean;
@@ -23,7 +26,12 @@ export type DashboardSignal = {
   volume: number;
   averageVolume50Day: number;
   volumeConfirmed: boolean;
+  movingAverage50Day: number;
   movingAverage200Day: number;
+  relativeStrength63: number;
+  chaikinMoneyFlow20: number;
+  higherHighHigherLow: boolean;
+  trendlineSlope63: number;
   extensionFrom200Day: number;
   extensionLabel: "Healthy" | "Caution" | "Extended";
   explanation: string;
@@ -85,6 +93,105 @@ function calculateSlowStochasticK(series: MarketPricePoint[], endIndex: number):
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function calculateTrendlineSlope(series: MarketPricePoint[], lookbackDays: number): number {
+  const slice = series.slice(Math.max(0, series.length - lookbackDays));
+  if (slice.length < 2) return 0;
+
+  const n = slice.length;
+  const meanX = (n - 1) / 2;
+  const meanY = slice.reduce((sum, point) => sum + point.close, 0) / n;
+
+  let numerator = 0;
+  let denominator = 0;
+
+  slice.forEach((point, index) => {
+    numerator += (index - meanX) * (point.close - meanY);
+    denominator += (index - meanX) ** 2;
+  });
+
+  const slope = denominator === 0 ? 0 : numerator / denominator;
+  return meanY > 0 ? slope / meanY : 0;
+}
+
+function hasHigherHighsAndHigherLows(series: MarketPricePoint[]): boolean {
+  if (series.length < 80) return false;
+
+  const recent = series.slice(-21);
+  const prior = series.slice(-63, -21);
+  const older = series.slice(-105, -63);
+
+  if (prior.length === 0 || older.length === 0) return false;
+
+  const recentHigh = Math.max(...recent.map((point) => point.high));
+  const priorHigh = Math.max(...prior.map((point) => point.high));
+  const recentLow = Math.min(...recent.map((point) => point.low));
+  const olderLow = Math.min(...older.map((point) => point.low));
+
+  return recentHigh > priorHigh && recentLow > olderLow;
+}
+
+function calculateRelativeStrength(stockSeries: MarketPricePoint[], spySeries: MarketPricePoint[], lookbackDays: number): number {
+  return calculateReturn(stockSeries, lookbackDays) - calculateReturn(spySeries, lookbackDays);
+}
+
+function calculateChaikinMoneyFlow(series: MarketPricePoint[], lookbackDays: number): number {
+  const slice = series.slice(Math.max(0, series.length - lookbackDays));
+  if (slice.length === 0) return 0;
+
+  let moneyFlowVolume = 0;
+  let totalVolume = 0;
+
+  slice.forEach((point) => {
+    const range = point.high - point.low;
+    const multiplier = range === 0 ? 0 : ((point.close - point.low) - (point.high - point.close)) / range;
+    moneyFlowVolume += multiplier * point.volume;
+    totalVolume += point.volume;
+  });
+
+  return totalVolume > 0 ? moneyFlowVolume / totalVolume : 0;
+}
+
+function getTrendStage(trendScore: number): TrendStage {
+  if (trendScore >= 75) return "STRONG UPTREND";
+  if (trendScore >= 60) return "UPTREND";
+  if (trendScore >= 40) return "NEUTRAL";
+  return "DOWNTREND";
+}
+
+function calculateTrendScore(params: {
+  price: number;
+  movingAverage50Day: number;
+  movingAverage200Day: number;
+  previousMovingAverage200Day: number;
+  higherHighHigherLow: boolean;
+  trendlineSlope63: number;
+  relativeStrength63: number;
+  stochasticK: number;
+  previousStochasticK: number;
+  chaikinMoneyFlow20: number;
+}) {
+  let score = 0;
+
+  if (params.price > params.movingAverage200Day) score += 20;
+  else if (params.price > params.movingAverage200Day * 0.97) score += 10;
+
+  if (params.movingAverage200Day > params.previousMovingAverage200Day) score += 15;
+  else if (params.movingAverage200Day >= params.previousMovingAverage200Day * 0.995) score += 7;
+
+  if (params.movingAverage50Day > params.movingAverage200Day) score += 15;
+
+  if (params.higherHighHigherLow) score += 15;
+
+  if (params.trendlineSlope63 > 0.001) score += 10;
+  else if (params.trendlineSlope63 > 0) score += 5;
+
+  if (params.relativeStrength63 > 0) score += 10;
+  if (params.stochasticK > params.previousStochasticK) score += 7;
+  if (params.chaikinMoneyFlow20 > 0) score += 8;
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
 function getExtensionLabel(extensionFrom200Day: number): "Healthy" | "Caution" | "Extended" {
   if (extensionFrom200Day > 0.2) return "Extended";
   if (extensionFrom200Day > 0.12) return "Caution";
@@ -92,7 +199,7 @@ function getExtensionLabel(extensionFrom200Day: number): "Healthy" | "Caution" |
 }
 
 function calculateConfidenceScore(params: {
-  trendUp: boolean;
+  trendScore: number;
   leader: boolean;
   momentumRank: number;
   stochasticK: number;
@@ -102,7 +209,7 @@ function calculateConfidenceScore(params: {
 }) {
   let score = 0;
 
-  if (params.trendUp) score += 25;
+  score += Math.round(params.trendScore * 0.35);
   if (params.leader) score += 20;
   if (params.momentumRank === 1) score += 10;
   else if (params.momentumRank === 2) score += 8;
@@ -110,7 +217,7 @@ function calculateConfidenceScore(params: {
 
   const crossedAbove20 = params.previousStochasticK < 20 && params.stochasticK >= 20;
   const stochasticRising = params.stochasticK > params.previousStochasticK;
-  const stochasticBuyZone = params.stochasticK >= 20 && params.stochasticK <= 55;
+  const stochasticBuyZone = params.stochasticK >= 20 && params.stochasticK <= 75;
 
   if (crossedAbove20) score += 20;
   else if (stochasticRising && stochasticBuyZone) score += 12;
@@ -119,8 +226,8 @@ function calculateConfidenceScore(params: {
   if (params.volumeConfirmed) score += 15;
 
   if (params.extensionFrom200Day <= 0.12) score += 10;
-  else if (params.extensionFrom200Day <= 0.15) score += 5;
-  else if (params.extensionFrom200Day > 0.2) score -= 15;
+  else if (params.extensionFrom200Day <= 0.25) score += 5;
+  else if (params.extensionFrom200Day > 0.3) score -= 15;
 
   return Math.max(0, Math.min(100, Math.round(score)));
 }
@@ -136,7 +243,7 @@ function getLeverageSignal(params: {
   extensionFrom200Day: number;
   hasLeveragedPosition?: boolean;
 }): LeverageSignal {
-  if (params.hasLeveragedPosition && (!params.trendUp || params.stochasticK >= 80 || params.extensionFrom200Day > 0.2)) {
+  if (params.hasLeveragedPosition && (!params.trendUp || params.stochasticK >= 80 || params.extensionFrom200Day > 0.3)) {
     return "EXIT 2X";
   }
 
@@ -144,18 +251,17 @@ function getLeverageSignal(params: {
     return "HOLD 2X";
   }
 
-  const crossedAbove20 = params.previousStochasticK < 20 && params.stochasticK >= 20;
-  const inBuyZone = params.stochasticK >= 20 && params.stochasticK <= 55;
+  const stochasticRising = params.stochasticK > params.previousStochasticK;
+  const inBuyZone = params.stochasticK >= 20 && params.stochasticK <= 65;
 
   if (
     params.coreSignal === "BUY" &&
-    params.confidenceScore >= 80 &&
+    params.confidenceScore >= 70 &&
     params.trendUp &&
     params.leader &&
-    crossedAbove20 &&
+    stochasticRising &&
     inBuyZone &&
-    params.volumeConfirmed &&
-    params.extensionFrom200Day <= 0.12
+    params.extensionFrom200Day <= 0.25
   ) {
     return "BUY 2X";
   }
@@ -163,13 +269,13 @@ function getLeverageSignal(params: {
   return "NO 2X";
 }
 
-function explain(signal: CoreSignal, leverageSignal: LeverageSignal, confidenceScore: number, stock: StockIndicatorState): string {
-  if (leverageSignal === "BUY 2X") return `High-confidence setup (${confidenceScore}%). Core buy and 2X trigger are both aligned.`;
+function explain(signal: CoreSignal, leverageSignal: LeverageSignal, confidenceScore: number, stock: StockIndicatorState, trendScore: number, trendStage: TrendStage): string {
+  if (leverageSignal === "BUY 2X") return `High-confidence ${trendStage.toLowerCase()} setup (${confidenceScore}%). Core buy and 2X trigger are both aligned.`;
   if (leverageSignal === "EXIT 2X") return "Exit 2X exposure because trend, overbought, or extension risk is elevated.";
-  if (!stock.trendUp) return "Trend filter failed. Avoid new buys until price is above a rising 200-day average.";
-  if (signal === "BUY") return `Core buy setup confirmed with ${confidenceScore}% confidence.`;
+  if (!stock.trendUp) return `Trend score is ${trendScore}. Avoid new buys until the broader trend improves.`;
+  if (signal === "BUY") return `Core buy setup confirmed with ${confidenceScore}% confidence and a ${trendStage.toLowerCase()} trend score.`;
   if (signal === "REDUCE") return "Take profits or reduce risk because the stock is overbought, too extended, or losing leadership.";
-  if (signal === "HOLD") return "Trend is intact, but this is not a fresh 2X entry setup.";
+  if (signal === "HOLD") return `Trend remains intact (${trendStage.toLowerCase()}), but this is not a fresh 2X entry setup.`;
   return "Watch this stock. Conditions are not yet aligned for entry.";
 }
 
@@ -178,6 +284,8 @@ export function buildDashboardSignals(
   positionByTicker: Partial<Record<Ticker, PositionState>> = {}
 ): DashboardSignal[] {
   if (!marketData) return [];
+
+  const spySeries = marketData.SPY ?? [];
 
   const momentumRanks = tickers
     .map((ticker) => ({
@@ -202,6 +310,8 @@ export function buildDashboardSignals(
         signal: "NONE",
         leverageSignal: "NO 2X",
         confidenceScore: 0,
+        trendScore: 0,
+        trendStage: "DOWNTREND",
         price: 0,
         trendUp: false,
         leader: false,
@@ -214,7 +324,12 @@ export function buildDashboardSignals(
         volume: 0,
         averageVolume50Day: 0,
         volumeConfirmed: false,
+        movingAverage50Day: 0,
         movingAverage200Day: 0,
+        relativeStrength63: 0,
+        chaikinMoneyFlow20: 0,
+        higherHighHigherLow: false,
+        trendlineSlope63: 0,
         extensionFrom200Day: 0,
         extensionLabel: "Healthy",
         explanation: "No market data available for this ticker.",
@@ -222,16 +337,34 @@ export function buildDashboardSignals(
     }
 
     const price = latest.close;
+    const movingAverage50Day = movingAverage(series, 50);
     const movingAverage200Day = movingAverage(series, 200);
     const previousMovingAverage200Day = movingAverage(series, 200, latestIndex - 30);
     const stochasticK = calculateSlowStochasticK(series, latestIndex);
     const previousStochasticK = calculateSlowStochasticK(series, latestIndex - 1);
     const averageVolume50Day = averageVolume(series, 50);
-    const trendUp = price > movingAverage200Day && movingAverage200Day > previousMovingAverage200Day;
+    const higherHighHigherLow = hasHigherHighsAndHigherLows(series);
+    const trendlineSlope63 = calculateTrendlineSlope(series, 63);
+    const relativeStrength63 = calculateRelativeStrength(series, spySeries, 63);
+    const chaikinMoneyFlow20 = calculateChaikinMoneyFlow(series, 20);
+    const trendScore = calculateTrendScore({
+      price,
+      movingAverage50Day,
+      movingAverage200Day,
+      previousMovingAverage200Day,
+      higherHighHigherLow,
+      trendlineSlope63,
+      relativeStrength63,
+      stochasticK,
+      previousStochasticK,
+      chaikinMoneyFlow20,
+    });
+    const trendStage = getTrendStage(trendScore);
+    const trendUp = trendScore >= 60;
     const momentumRank = momentumRanks[ticker] ?? 7;
-    const leader = momentumRank <= 3;
+    const leader = momentumRank <= 5;
     const extensionFrom200Day = movingAverage200Day > 0 ? (price - movingAverage200Day) / movingAverage200Day : 0;
-    const volumeConfirmed = averageVolume50Day > 0 && latest.volume >= averageVolume50Day * 1.05;
+    const volumeConfirmed = averageVolume50Day > 0 && latest.volume >= averageVolume50Day;
 
     const stock: StockIndicatorState = {
       ticker,
@@ -251,7 +384,7 @@ export function buildDashboardSignals(
     const position = positionByTicker[ticker] ?? { hasCorePosition: false };
     const signal = getCoreSignal(stock, position);
     const confidenceScore = calculateConfidenceScore({
-      trendUp,
+      trendScore,
       leader,
       momentumRank,
       stochasticK,
@@ -277,6 +410,8 @@ export function buildDashboardSignals(
       signal,
       leverageSignal,
       confidenceScore,
+      trendScore,
+      trendStage,
       price,
       trendUp,
       leader,
@@ -289,10 +424,15 @@ export function buildDashboardSignals(
       volume: latest.volume,
       averageVolume50Day,
       volumeConfirmed,
+      movingAverage50Day,
       movingAverage200Day,
+      relativeStrength63,
+      chaikinMoneyFlow20,
+      higherHighHigherLow,
+      trendlineSlope63,
       extensionFrom200Day,
       extensionLabel: getExtensionLabel(extensionFrom200Day),
-      explanation: explain(signal, leverageSignal, confidenceScore, stock),
+      explanation: explain(signal, leverageSignal, confidenceScore, stock, trendScore, trendStage),
     };
   });
 }
