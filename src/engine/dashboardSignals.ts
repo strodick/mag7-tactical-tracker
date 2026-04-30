@@ -179,7 +179,6 @@ function calculateTrendScore(params: {
   else if (params.movingAverage200Day >= params.previousMovingAverage200Day * 0.995) score += 7;
 
   if (params.movingAverage50Day > params.movingAverage200Day) score += 15;
-
   if (params.higherHighHigherLow) score += 15;
 
   if (params.trendlineSlope63 > 0.001) score += 10;
@@ -241,6 +240,7 @@ function getLeverageSignal(params: {
   previousStochasticK: number;
   volumeConfirmed: boolean;
   extensionFrom200Day: number;
+  relativeStrength63: number;
   hasLeveragedPosition?: boolean;
 }): LeverageSignal {
   if (params.hasLeveragedPosition && (!params.trendUp || params.stochasticK >= 80 || params.extensionFrom200Day > 0.3)) {
@@ -256,12 +256,13 @@ function getLeverageSignal(params: {
 
   if (
     params.coreSignal === "BUY" &&
-    params.confidenceScore >= 70 &&
+    params.confidenceScore >= 78 &&
     params.trendUp &&
     params.leader &&
+    params.relativeStrength63 > 0 &&
     stochasticRising &&
     inBuyZone &&
-    params.extensionFrom200Day <= 0.25
+    params.extensionFrom200Day <= 0.2
   ) {
     return "BUY 2X";
   }
@@ -360,9 +361,9 @@ export function buildDashboardSignals(
       chaikinMoneyFlow20,
     });
     const trendStage = getTrendStage(trendScore);
-    const trendUp = trendScore >= 60;
+    const trendUp = trendScore >= 65;
     const momentumRank = momentumRanks[ticker] ?? 7;
-    const leader = momentumRank <= 5;
+    const leader = momentumRank <= 6;
     const extensionFrom200Day = movingAverage200Day > 0 ? (price - movingAverage200Day) / movingAverage200Day : 0;
     const volumeConfirmed = averageVolume50Day > 0 && latest.volume >= averageVolume50Day;
 
@@ -401,6 +402,7 @@ export function buildDashboardSignals(
       previousStochasticK,
       volumeConfirmed,
       extensionFrom200Day,
+      relativeStrength63,
       hasLeveragedPosition: position.hasLeveragedPosition,
     });
 
